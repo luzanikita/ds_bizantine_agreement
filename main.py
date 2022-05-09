@@ -34,7 +34,9 @@ def command_input(command, clients, generals):
     command = command.split(" ")
     
     try:
-        coordinator = clients[-1].coordinator
+        last_id = generals[-1]
+        coordinator = clients[last_id].coordinator
+
         if command[0] == "g-state" and len(command) == 1:
             send(coordinator, "LIST-ALL")
 
@@ -42,7 +44,6 @@ def command_input(command, clients, generals):
             assert is_int(command[1])
             assert command[2] in ["faulty", "non-faulty"]
             send(coordinator, ";".join(command))
-            send(coordinator, "LIST-ALL")
 
         elif command[0] == "g-add" and len(command) > 1:
             assert is_int(command[1])
@@ -56,7 +57,7 @@ def command_input(command, clients, generals):
                     copy.deepcopy(generals),
                     coordinator
                 )
-                clients.append(client)
+                clients[client.id] = client
                 reactor.listenUDP(
                     10000+client.id, 
                     client
@@ -72,7 +73,10 @@ def command_input(command, clients, generals):
             if id_ in generals:
                 generals.remove(id_)
             send(coordinator, ";".join(command))
-            send(coordinator, f"LIST-ALL")
+        
+        elif command[0] == "actual-order" and len(command) > 1:
+            assert command[1] in ["attack", "retreat"]
+            send(coordinator, ";".join(command))
         else:
             print("Wrong command!")
 
@@ -92,19 +96,19 @@ if __name__ == "__main__":
     coordinator = 1
     generals = list(range(2, args.processes+1))
 
-    clients = [
-        Client(
+    clients = {
+        id_: Client(
             id_, 
             "localhost", 
             "G"+str(id_), 
             copy.deepcopy(generals),
             coordinator
         ) for id_ in [coordinator] + generals
-    ]
+    }
 
-    for client in clients:
+    for id_, client in clients.items():
         reactor.listenUDP(
-            10000+client.id, 
+            10000+id_, 
             client
         )
 

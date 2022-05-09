@@ -2,6 +2,7 @@ from twisted.internet.protocol import DatagramProtocol
 from twisted.internet import reactor
 from time import sleep
 from config import DEBUG
+from random import choice
 
 
 class Client(DatagramProtocol):
@@ -20,10 +21,11 @@ class Client(DatagramProtocol):
         self.listen_state = True
         self.coordinator = coordinator_id
         self.faulty = False
-        self.heartbeat = 500
+        self.heartbeat = 300
         self.heartbeat_counter = 0
         self.election_running = False
-    
+        self.faulty_nodes = []
+
     def get_state(self):
         return "F" if self.faulty else "NF"
 
@@ -32,7 +34,10 @@ class Client(DatagramProtocol):
 
     def datagramReceived(self, datagram: bytes, addr):
         datagram = datagram.decode('utf-8')
+        # try:
         self.process_datagram(datagram)
+        # except:
+        #     print("Command canceled!")
     
     def startProtocol(self):
         reactor.callInThread(self.time_tick)
@@ -65,27 +70,39 @@ class Client(DatagramProtocol):
             print(f"{self.name} is not responding!")
             return 
         
-        if function == "g-state":
-            self.send(int(args[0]), f"SET;{args[1]}")
+        if function == "g-state" and not self.election_running:
+            id_ = int(args[0])
+            state = args[1]
+            self.send(id_, f"SET;{state}")
 
         elif function == "SET":
-            self.faulty = args[0] == "faulty"
+            state = args[0]
+            self.faulty = state == "faulty"
+            self.send(self.coordinator, "LIST-ALL;")
+
         
-        elif function == "LIST-ALL":
+        elif function == "LIST-ALL" and not self.election_running:
             print(f"{self.name}, {self.get_rank()}, state={self.get_state()}")
             self.broadcast("LIST;")
 
         elif function == "LIST":
             print(f"{self.name}, {self.get_rank()}, state={self.get_state()}")
+
     
-        elif function == "ADD-ALL":
-            self.participants.append(int(args[0]))
-            self.broadcast(f"ADD;{args[0]}")
+        elif function == "ADD-ALL" and not self.election_running:
+            id_ = int(args[0])
+            if id_ not in self.participants:
+                self.participants.append(id_)
+            self.broadcast(f"ADD;{id_}")
         
         elif function == "ADD":
-            self.participants.append(int(args[0]))
+            id_ = int(args[0])
+            if id_ not in self.participants:
+                self.participants.append(id_)
+            if self.coordinator in self.participants:
+                self.participants.remove(self.coordinator)
 
-        elif function == "g-kill":
+        elif function == "g-kill" and not self.election_running:
             id_ = int(args[0])
             if id_ == self.coordinator:
                 self.listen_state = False
@@ -94,6 +111,7 @@ class Client(DatagramProtocol):
             else:
                 self.broadcast(f"REMOVE;{id_}")
                 self.participants.remove(id_)
+                self.send(self.id, "LIST-ALL;")
         
         elif function == "REMOVE":
             id_ = int(args[0])
@@ -102,7 +120,7 @@ class Client(DatagramProtocol):
                 self.respond_state = False
                 self.waiting_state = False
                 self.waiting_counter = 0
-            self.participants.remove(int(args[0]))
+            self.participants.remove(id_)
         
         elif function == "HEARTBEAT":
             self.send(int(args[0]), "HEARTBEAT-OK;")
@@ -112,11 +130,9 @@ class Client(DatagramProtocol):
             self.waiting_counter = 0
         
         elif function == "ELECTION-START":
-            self.ready = []
             self.send(int(args[0]), f"ELECTION-OK;{self.id}")
         
         elif function == "ELECTION-OK":
-            self.ready.append(int(args[0]))
             self.waiting_state = False
             self.waiting_counter = 0
         
@@ -126,12 +142,81 @@ class Client(DatagramProtocol):
             self.participants.remove(coordinator_id)
             self.coordinator = coordinator_id
 
+        elif function == "actual-order" and not self.election_running:
+            self.order = args[0]
+            print(f"{self.name}, {self.get_rank()}, majority={self.order}, state={self.get_state()}")
+
+            self.ready = []
+            self.faulty_nodes = [self.faulty]
+            for id_ in self.participants:
+                order = self.random_order() if self.faulty else self.order
+                self.send(id_, f"CONSENSUS-START;{order};{self.get_state()}")
+        
+        elif function == "CONSENSUS-START":
+            self.order = args[0]
+            coordinator_state = args[1] == "F"
+            self.ready = []
+            self.faulty_nodes = [coordinator_state]
+            self.broadcast(f"CONSENSUS-EXCHANGE;{self.order};{self.get_state()}")
+
+        elif function == "CONSENSUS-EXCHANGE":
+            order = args[0]
+            state = args[1] == "F"
+            self.ready.append(order)
+            self.faulty_nodes.append(state)
+
+            if len(self.ready) == len(self.participants):
+                k = sum(self.faulty_nodes)
+                if len(self.participants) < 3 * k:
+                    self.order = "undefined"
+                else:
+                    self.order, _ = self.get_final_order(self.ready)
+                self.end_consensus()
+            
+        elif function == "CONSENSUS-END":
+            order = args[0]
+            state = args[1] == "F"
+            if state:
+                order = "undefined"
+            self.ready.append(order)
+            self.faulty_nodes.append(state)
+            if len(self.ready) == len(self.participants):
+                order, count = self.get_final_order(self.ready)
+                k = sum(self.faulty_nodes)
+                n = len(self.participants) + 1
+                if order == "undefined":
+                    print(f"Execute order: cannot be determined – not enough generals in the system! {k} faulty node in the system - {count} out of {n} quorum not consistent")
+                else:
+                    print(f"Execute order: {order}! {k} faulty nodes in the system – {count} out of {n} quorum suggest {order}")
+
+    def end_consensus(self):
+        print(f"{self.name}, {self.get_rank()}, majority={self.order}, state={self.get_state()}")
+        self.send(self.coordinator, f"CONSENSUS-END;{self.order};{self.get_state()}")
+    
+    def get_final_order(self, order_list):
+        poll = {}
+        for order in order_list:
+            poll[order] = poll.get(order, 0) + 1
+        
+        final_order = None
+        final_count = -1
+        for order, count in poll.items():
+            if count > final_count:
+                final_order = order
+                final_count = count
+        
+        return final_order, final_count
+
+    def random_order(self):
+        return choice(["attack", "retreat"])
+
     def check_heartbeat(self):
         if self.id != self.coordinator:
             self.waiting_state = True
             self.send(self.coordinator, f"HEARTBEAT;{self.id}")
 
     def start_election(self):
+        print(f"{self.name} joined election")
         self.election_running = True
         self.waiting_counter = 0
         self.waiting_state = True
@@ -146,6 +231,8 @@ class Client(DatagramProtocol):
         self.coordinator = self.id
         self.participants.remove(self.id)
         self.broadcast(f"ELECTION-END;{self.id}")
+        print(f"{self.name} was elected")
+        self.send(self.id, "LIST-ALL;")
 
     def send(self, destination_id, string):
         if not self.respond_state:
